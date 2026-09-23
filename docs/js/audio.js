@@ -23,14 +23,23 @@ export class AudioEngine {
     this.onChunk = null;
     this.encoder = new AdpcmEncoder();
     this.micStopTimer = null;
+    this.opening = null; // Promise: openMic() in flight
+    this.worklet = null; // Promise: capture worklet module loaded (see loadWorklet)
   }
 
-  /** Must be called from a user gesture (autoplay policies). */
-  async init() {
-    if (this.ctx) return this.resume();
+  /**
+   * Creates the audio graph and starts the context. Must be called synchronously
+   * from a user gesture (click/tap): WebKit lets an AudioContext start only while
+   * the gesture is being processed, and a resume() outside of it never settles.
+   * That is why nothing here is awaited.
+   */
+  init() {
+    if (this.ctx) {
+      this.resume();
+      return;
+    }
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     this.ctx = ctx;
-    await ctx.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url));
 
     // Received voice: narrow band with a nasal mid bump, like a small radio speaker.
     const highpass = new BiquadFilterNode(ctx, { type: "highpass", frequency: 350 });
@@ -44,11 +53,27 @@ export class AudioEngine {
     const data = noise.getChannelData(0);
     for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
     this.noise = noise;
-    await this.resume();
+
+    this.resume();
+    this.loadWorklet(); // only needed to transmit: fetch it in the background
   }
 
-  async resume() {
-    if (this.ctx && this.ctx.state !== "running") await this.ctx.resume();
+  /** Resumes a suspended (or, on iOS, interrupted) context. Fire and forget, see init(). */
+  resume() {
+    const ctx = this.ctx;
+    if (!ctx || ctx.state === "running") return;
+    ctx.resume().catch((err) => console.warn("[audio] resume", err));
+  }
+
+  /** Loads the capture worklet once; a failed load is retried on the next call. */
+  loadWorklet() {
+    if (!this.worklet) {
+      this.worklet = this.ctx.audioWorklet
+        ? this.ctx.audioWorklet.addModule(new URL("./capture-worklet.js", import.meta.url))
+        : Promise.reject(new Error("AudioWorklet non supportato"));
+      this.worklet.catch(() => (this.worklet = null));
+    }
+    return this.worklet;
   }
 
   // ------------------------------------------------------------------ capture
@@ -63,9 +88,26 @@ export class AudioEngine {
     this.onChunk = onChunk;
     if (this.stream) return;
     if (!this.micSupported) throw new Error("getUserMedia non disponibile (serve HTTPS)");
+    this.opening ??= this.openMic().finally(() => (this.opening = null));
+    await this.opening;
+  }
+
+  async openMic() {
+    // Ask for the microphone first, so that the prompt is tied to the user's gesture.
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    try {
+      await this.loadWorklet();
+    } catch (err) {
+      stream.getTracks().forEach((t) => t.stop());
+      throw err;
+    }
+    if (!this.onChunk) {
+      // Released (or powered off) while the prompt was open: don't keep the mic on.
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
     this.stream = stream;
     this.micSource = this.ctx.createMediaStreamSource(stream);
     this.micNode = new AudioWorkletNode(this.ctx, "capture-processor", { numberOfOutputs: 1 });

@@ -82,7 +82,7 @@ async function powerOn() {
   if (radio || powering) return;
   powering = true;
   try {
-    await audio.init();
+    audio.init(); // synchronously: the audio must start while the tap is being processed
     config ??= await loadConfig();
   } catch (err) {
     console.error(err);
@@ -91,7 +91,7 @@ async function powerOn() {
   } finally {
     powering = false;
   }
-  radio =new Radio({ brokerUrl: config.broker, prefix: config.prefix, channel });
+  radio = new Radio({ brokerUrl: config.broker, prefix: config.prefix, channel });
   radio.addEventListener("change", render);
   radio.addEventListener("audio", (e) => audio.play(e.detail));
   radio.addEventListener("rx-start", () => {
@@ -161,14 +161,20 @@ async function pttDown() {
     });
   } catch (err) {
     console.warn(err);
-    radio.releaseTalk();
+    radio?.releaseTalk();
     pressed = false;
     ui.ptt.classList.remove("pressed");
-    showFlash(audio.micSupported ? "MICROFONO NEGATO" : "MICROFONO: SERVE HTTPS");
+    showFlash(micErrorText(err));
     refuse();
     return;
   }
   if (!pressed) pttUp(true);
+}
+
+function micErrorText(err) {
+  if (!audio.micSupported) return "MICROFONO: SERVE HTTPS";
+  if (err?.name === "NotAllowedError" || err?.name === "SecurityError") return "MICROFONO NEGATO";
+  return "MICROFONO NON DISPONIBILE";
 }
 
 function pttUp(force = false) {
@@ -327,11 +333,16 @@ function render() {
 
 // ------------------------------------------------------------------ events
 
+// While off, the tap's "click" powers on: on iOS a touch "pointerdown" is not a
+// user activation for audio, so the AudioContext could not start from it.
 ui.ptt.addEventListener("pointerdown", (e) => {
-  if (e.button !== 0) return;
+  if (e.button !== 0 || !radio) return;
   e.preventDefault();
   ui.ptt.setPointerCapture?.(e.pointerId);
   pttDown();
+});
+ui.ptt.addEventListener("click", () => {
+  if (!radio) powerOn();
 });
 ["pointerup", "pointercancel", "lostpointercapture"].forEach((type) => ui.ptt.addEventListener(type, () => pttUp()));
 ui.ptt.addEventListener("contextmenu", (e) => e.preventDefault());
