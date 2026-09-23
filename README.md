@@ -31,6 +31,14 @@ persona alla volta, come su una radio vera.
 - **Audio.** Microfono → AudioWorklet (banda 300–3000 Hz, saturazione morbida) → 8 kHz,
   IMA ADPCM 4 bit (32 kbit/s, ~4 kB/s) → pacchetti da 100 ms, ognuno decodificabile da
   solo → buffer anti-jitter, altoparlante "radio" e fruscio di portante in ricezione.
+- **In background.** Finché la radio è accesa la pagina riproduce una traccia silenziosa
+  in un elemento `<audio>`: è quello che convince il browser a tenere vivi audio, timer e
+  connessione anche con lo schermo spento o l'app in secondo piano, e mette la radio nei
+  controlli multimediali del lock screen. I timer del protocollo girano in un Web Worker,
+  che il browser non rallenta in background, e un watchdog riconnette entro pochi secondi
+  quando la connessione muore in silenzio (tipico al risveglio del telefono): il broker
+  rimanda a ogni client i suoi stessi battiti di presenza, e se l'eco smette la radio apre
+  una connessione nuova con lo stesso id.
 
 Il client (`docs/`) è **solo statico**: HTML, CSS e JS senza build. Per questo può essere
 pubblicato così com'è su GitHub Pages.
@@ -83,9 +91,19 @@ Il server locale invece restituisce un proprio `config.json` che punta a se stes
   beep sei in onda; al rilascio parte il "roger beep".
 - **🔔** fa trillare tutte le radio sul canale. Durante l'attesa mostra i secondi mancanti.
 
-Note: su iPhone l'interruttore silenzioso azzera l'audio web. Lo schermo resta acceso
-(Wake Lock) finché la radio è accesa, perché con lo schermo spento il browser sospende la
-connessione.
+Note:
+
+- **Schermo spento e app in secondo piano.** La radio continua a ricevere (voce e trilli)
+  e resta visibile agli altri anche con lo schermo bloccato o con un'altra app in primo
+  piano, su Android (Chrome) e iOS (Safari, anche aggiunta alla schermata Home). Sul lock
+  screen compare la scheda multimediale con canale e stato: *pausa* spegne la radio, *play*
+  la riaccende. Per parlare serve comunque lo schermo. Se un'altra app prende l'audio
+  (musica, chiamata) il sistema può sospendere la pagina: tornando in primo piano la radio
+  si riconnette da sola.
+- Su iPhone la radio suona anche con l'interruttore silenzioso attivo, come un lettore
+  musicale. Serve iOS 17.5 o successivo per il funzionamento migliore in background.
+- Lo schermo resta acceso (Wake Lock) finché la pagina è in primo piano con la radio
+  accesa; bloccarlo con il tasto resta possibile.
 
 ## Struttura
 
@@ -95,7 +113,8 @@ docs/                     client statico (radice di GitHub Pages)
   config.json             broker + prefisso usati su GitHub Pages
   js/app.js               interfaccia e PTT
   js/radio.js             presenza, arbitraggio del canale, topic MQTT
-  js/audio.js             cattura, riproduzione, effetti
+  js/audio.js             cattura, riproduzione, effetti, traccia keep-alive
+  js/timers.js            timer in un Web Worker (non rallentati in background)
   js/capture-worklet.js   filtro radio + ricampionamento a 8 kHz
   js/adpcm.js             codec IMA ADPCM (4 bit, 32 kbit/s)
   vendor/mqtt.min.js      mqtt.js 5.16.0 (MIT)

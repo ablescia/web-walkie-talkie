@@ -1,5 +1,12 @@
 // Audio engine: microphone capture (via AudioWorklet), jitter-buffered playback
 // of received ADPCM chunks and synthesized radio sound effects.
+//
+// Background: mobile browsers suspend Web Audio as soon as the screen locks or
+// the app leaves the foreground, unless the page is playing a media element.
+// While the radio is on we therefore keep a looping silent track playing in an
+// <audio> element: it holds the audio session open (so the context, the timers
+// and the WebSocket keep working with the screen off), ignores the iPhone's
+// silent switch, and gives the radio media controls on the lock screen.
 
 import { AdpcmEncoder, decodeAdpcm } from "./adpcm.js";
 
@@ -8,10 +15,48 @@ const JITTER_S = 0.18; // initial playback delay, absorbs network jitter
 const MAX_LAG_S = 1.0; // drop audio if we fall this far behind
 const MIC_IDLE_STOP_MS = 8000; // keep the mic warm briefly between transmissions
 const HISS_VOLUME = 0.012; // carrier noise under received voice
+const KEEPALIVE_S = 10; // silent track length: Chrome gives no media controls to tracks under 5 s
+
+/** A WAV file of `seconds` of digital silence (8 kHz, 16 bit, mono). */
+function silentWav(seconds) {
+  const rate = 8000;
+  const dataBytes = rate * seconds * 2;
+  const view = new DataView(new ArrayBuffer(44 + dataBytes)); // samples are already zero
+  const tag = (offset, text) => [...text].forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
+  tag(0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  tag(8, "WAVE");
+  tag(12, "fmt ");
+  view.setUint32(16, 16, true); // fmt chunk size
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // channels
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  tag(36, "data");
+  view.setUint32(40, dataBytes, true);
+  return view.buffer;
+}
+
+/**
+ * Tells WebKit what the page's audio is for (Audio Session API, iOS 17+).
+ * "playback" keeps the context running in the background and through the
+ * silent switch; capturing needs "play-and-record", or the microphone is muted.
+ */
+function setAudioSessionType(type) {
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = type;
+  } catch {
+    /* value not supported by this version */
+  }
+}
 
 export class AudioEngine {
   constructor() {
     this.ctx = null;
+    this.on = false; // radio switched on: keep the context and the keep-alive running
+    this.keepAlive = null; // <audio> looping the silent track, see the header
     this.rxIn = null;
     this.noise = null;
     this.hiss = null;
@@ -28,41 +73,76 @@ export class AudioEngine {
   }
 
   /**
-   * Creates the audio graph and starts the context. Must be called synchronously
-   * from a user gesture (click/tap): WebKit lets an AudioContext start only while
-   * the gesture is being processed, and a resume() outside of it never settles.
-   * That is why nothing here is awaited.
+   * Creates the audio graph, starts the context and the keep-alive track. Must be
+   * called synchronously from a user gesture (click/tap): WebKit lets an
+   * AudioContext (and a media element) start only while the gesture is being
+   * processed, and a resume() outside of it never settles. That is why nothing
+   * here is awaited.
    */
   init() {
-    if (this.ctx) {
-      this.resume();
-      return;
+    this.on = true;
+    setAudioSessionType("playback");
+    if (!this.ctx) {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      this.ctx = ctx;
+
+      // Received voice: narrow band with a nasal mid bump, like a small radio speaker.
+      const highpass = new BiquadFilterNode(ctx, { type: "highpass", frequency: 350 });
+      const presence = new BiquadFilterNode(ctx, { type: "peaking", frequency: 1800, Q: 1.1, gain: 5 });
+      const lowpass = new BiquadFilterNode(ctx, { type: "lowpass", frequency: 3000 });
+      const gain = new GainNode(ctx, { gain: 1.2 });
+      highpass.connect(presence).connect(lowpass).connect(gain).connect(ctx.destination);
+      this.rxIn = highpass;
+
+      const noise = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+      const data = noise.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+      this.noise = noise;
+
+      // iOS reports "interrupted" during a call or Siri and sometimes on unlock:
+      // pick the context back up as soon as we are visible again. Only the
+      // context: restarting the keep-alive here could fight another app for
+      // the audio focus that just paused it.
+      ctx.addEventListener("statechange", () => {
+        if (ctx.state !== "running" && this.on && !document.hidden) this.resumeContext();
+      });
     }
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    this.ctx = ctx;
-
-    // Received voice: narrow band with a nasal mid bump, like a small radio speaker.
-    const highpass = new BiquadFilterNode(ctx, { type: "highpass", frequency: 350 });
-    const presence = new BiquadFilterNode(ctx, { type: "peaking", frequency: 1800, Q: 1.1, gain: 5 });
-    const lowpass = new BiquadFilterNode(ctx, { type: "lowpass", frequency: 3000 });
-    const gain = new GainNode(ctx, { gain: 1.2 });
-    highpass.connect(presence).connect(lowpass).connect(gain).connect(ctx.destination);
-    this.rxIn = highpass;
-
-    const noise = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
-    const data = noise.getChannelData(0);
-    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
-    this.noise = noise;
-
     this.resume();
     this.loadWorklet(); // only needed to transmit: fetch it in the background
   }
 
-  /** Resumes a suspended (or, on iOS, interrupted) context. Fire and forget, see init(). */
+  /** Resumes a suspended (or, on iOS, interrupted) context and the keep-alive. Fire and forget, see init(). */
   resume() {
+    if (!this.ctx || !this.on) return;
+    this.resumeContext();
+    if (!this.keepAlive || this.keepAlive.paused) this.startKeepAlive();
+  }
+
+  resumeContext() {
     const ctx = this.ctx;
-    if (!ctx || ctx.state === "running") return;
-    ctx.resume().catch((err) => console.warn("[audio] resume", err));
+    if (ctx.state !== "running") ctx.resume().catch((err) => console.warn("[audio] resume", err));
+  }
+
+  /** Radio switched off: release the microphone, stop the keep-alive and let the audio hardware sleep. */
+  standby() {
+    this.on = false;
+    this.closeMic();
+    this.keepAlive?.pause();
+    this.ctx?.suspend().catch(() => {});
+  }
+
+  startKeepAlive() {
+    if (!this.keepAlive) {
+      const el = document.createElement("audio");
+      el.src = URL.createObjectURL(new Blob([silentWav(KEEPALIVE_S)], { type: "audio/wav" }));
+      el.loop = true;
+      el.preload = "auto";
+      el.setAttribute("playsinline", "");
+      el.hidden = true;
+      document.body.append(el);
+      this.keepAlive = el;
+    }
+    this.keepAlive.play()?.catch((err) => console.warn("[audio] keep-alive", err));
   }
 
   /** Loads the capture worklet once; a failed load is retried on the next call. */
@@ -93,22 +173,28 @@ export class AudioEngine {
   }
 
   async openMic() {
-    // Ask for the microphone first, so that the prompt is tied to the user's gesture.
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
+    setAudioSessionType("play-and-record");
+    let stream = null;
     try {
+      // Ask for the microphone first, so that the prompt is tied to the user's gesture.
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       await this.loadWorklet();
     } catch (err) {
-      stream.getTracks().forEach((t) => t.stop());
+      stream?.getTracks().forEach((t) => t.stop());
+      setAudioSessionType("playback");
       throw err;
     }
     if (!this.onChunk) {
       // Released (or powered off) while the prompt was open: don't keep the mic on.
       stream.getTracks().forEach((t) => t.stop());
+      setAudioSessionType("playback");
       return;
     }
     this.stream = stream;
+    // A track the system ends (device gone, capture revoked) is replaced on the next transmission.
+    stream.getTracks().forEach((t) => t.addEventListener("ended", () => this.stream === stream && this.closeMic()));
     this.micSource = this.ctx.createMediaStreamSource(stream);
     this.micNode = new AudioWorkletNode(this.ctx, "capture-processor", { numberOfOutputs: 1 });
     this.micNode.port.onmessage = (e) => this.onChunk?.(this.encoder.encode(e.data));
@@ -125,10 +211,12 @@ export class AudioEngine {
 
   closeMic() {
     this.onChunk = null;
+    clearTimeout(this.micStopTimer);
     this.stream?.getTracks().forEach((t) => t.stop());
     this.micSource?.disconnect();
     this.micNode?.disconnect();
     this.stream = this.micSource = this.micNode = null;
+    setAudioSessionType("playback");
   }
 
   // ------------------------------------------------------------------ playback

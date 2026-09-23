@@ -14,12 +14,23 @@
 //
 // Rings are limited to one per RING_COOLDOWN_MS by the sender; receivers also
 // drop rings that come too soon from the same id.
+//
+// Liveness: we are subscribed to the presence topic, so the broker echoes our
+// own heartbeats back to us. When the echo stops (ECHO_TIMEOUT_MS) the
+// connection is dead even if the socket still looks open, as happens after the
+// phone comes back from standby, and we open a new one: connecting again with
+// the same client id makes the broker drop the stale session. All timers run
+// through timers.js so they keep their pace while the page is in the background.
+
+import { timers } from "./timers.js";
 
 export const CHANNEL_MIN = 1;
 export const CHANNEL_MAX = 99;
 
 const HEARTBEAT_MS = 5000;
 const PRESENCE_TTL_MS = 16000;
+const ECHO_TIMEOUT_MS = 15000; // three heartbeats without hearing ourselves: reconnect
+const PROBE_TIMEOUT_MS = 4000; // same, for the heartbeat sent when the page wakes up
 const FLOOR_TIMEOUT_MS = 2000;
 const GRANT_TIMEOUT_MS = 3000;
 const CONTENTION_MS = 400;
@@ -58,6 +69,8 @@ export class Radio extends EventTarget {
     this.presenceDebounce = null;
     this.settleTimer = null;
     this.rings = new Map(); // id -> when we last accepted a ring from it
+    this.echoAt = 0; // when the broker last echoed one of our own presence messages
+    this.probeAt = 0; // when wake() sent a heartbeat that is still waiting for its echo
   }
 
   // ---------------------------------------------------------------- lifecycle
@@ -65,7 +78,32 @@ export class Radio extends EventTarget {
   connect() {
     this.status = "connecting";
     this.emit("change");
-    this.client = mqtt.connect(this.brokerUrl, {
+    this.openClient();
+    this.timers.push(timers.setInterval(() => this.announce(false), HEARTBEAT_MS));
+    this.timers.push(timers.setInterval(() => this.tick(), 250));
+  }
+
+  disconnect() {
+    this.releaseTalk();
+    this.timers.forEach(timers.clear);
+    this.timers = [];
+    timers.clear(this.helloReply);
+    timers.clear(this.presenceDebounce);
+    if (this.client) {
+      if (this.client.connected) this.publishJson(this.topic("presence"), { id: this.id, on: false });
+      this.client.end(false);
+      this.client = null;
+    }
+    this.peers.clear();
+    this.rings.clear();
+    this.clearFloor();
+    this.status = "offline";
+    this.emit("change");
+  }
+
+  /** Opens the MQTT connection. Handlers ignore events from a client that has been replaced. */
+  openClient() {
+    const client = mqtt.connect(this.brokerUrl, {
       clientId: `wt-${this.id}`,
       protocolVersion: 4,
       clean: true,
@@ -79,36 +117,45 @@ export class Radio extends EventTarget {
         retain: false,
       },
     });
-    this.client.on("connect", () => {
-      this.status = "online";
-      this.tunedAt = Date.now();
-      this.client.subscribe([this.topic("presence"), this.channelTopic(this.channel, "#")]);
-      this.announce(true);
-      this.emit("change");
-    });
-    this.client.on("reconnect", () => this.setStatus("connecting"));
-    this.client.on("offline", () => this.setStatus("connecting"));
-    this.client.on("error", (err) => console.warn("[radio] mqtt error", err));
-    this.client.on("message", (topic, payload) => this.onMessage(topic, payload));
-
-    this.timers.push(setInterval(() => this.announce(false), HEARTBEAT_MS));
-    this.timers.push(setInterval(() => this.tick(), 250));
+    this.client = client;
+    const current = (handler) => (...args) => this.client === client && handler(...args);
+    client.on(
+      "connect",
+      current(() => {
+        this.status = "online";
+        this.tunedAt = Date.now();
+        this.echoAt = Date.now();
+        this.probeAt = 0;
+        client.subscribe([this.topic("presence"), this.channelTopic(this.channel, "#")]);
+        this.announce(true);
+        this.emit("change");
+      }),
+    );
+    client.on("reconnect", current(() => this.setStatus("connecting")));
+    client.on("offline", current(() => this.setStatus("connecting")));
+    client.on("error", (err) => console.warn("[radio] mqtt error", err));
+    client.on("message", current((topic, payload) => this.onMessage(topic, payload)));
   }
 
-  disconnect() {
-    this.releaseTalk();
-    this.timers.forEach(clearInterval);
-    this.timers = [];
-    if (this.client) {
-      if (this.client.connected) this.publishJson(this.topic("presence"), { id: this.id, on: false });
-      this.client.end(false);
-      this.client = null;
-    }
-    this.peers.clear();
-    this.rings.clear();
-    this.clearFloor();
-    this.status = "offline";
-    this.emit("change");
+  /** Drops a connection that stopped echoing us and opens a fresh one with the same id. */
+  reconnect() {
+    const stale = this.client;
+    if (!stale) return;
+    console.warn("[radio] no echo from the broker, reconnecting");
+    this.setStatus("connecting");
+    stale.end(true);
+    this.openClient();
+  }
+
+  /**
+   * The page is back in the foreground (or the network is back): the socket may
+   * be dead without anybody having noticed. Send a heartbeat right away and let
+   * tick() reconnect unless its echo arrives within PROBE_TIMEOUT_MS.
+   */
+  wake() {
+    if (this.status !== "online" || this.probeAt) return;
+    this.probeAt = Date.now();
+    this.announce(false);
   }
 
   setStatus(status) {
@@ -132,8 +179,8 @@ export class Radio extends EventTarget {
     if (this.client) {
       this.client.unsubscribe(this.channelTopic(previous, "#"));
       this.client.subscribe(this.channelTopic(channel, "#"));
-      clearTimeout(this.presenceDebounce);
-      this.presenceDebounce = setTimeout(() => this.announce(false), 150);
+      timers.clear(this.presenceDebounce);
+      this.presenceDebounce = timers.setTimeout(() => this.announce(false), 150);
     }
     this.emit("change");
     return true;
@@ -233,7 +280,13 @@ export class Radio extends EventTarget {
   }
 
   onPresence(msg) {
-    if (!msg || typeof msg.id !== "string" || msg.id === this.id) return;
+    if (!msg || typeof msg.id !== "string") return;
+    if (msg.id === this.id) {
+      // Our own message coming back: proof that the connection is alive.
+      this.echoAt = Date.now();
+      this.probeAt = 0;
+      return;
+    }
     if (!msg.on) {
       this.peers.delete(msg.id);
       this.withdraw(msg.id);
@@ -243,8 +296,8 @@ export class Radio extends EventTarget {
       this.peers.set(msg.id, { ch, seen: Date.now() });
       if (msg.hello) {
         // A newcomer asks who's around: answer after a random delay to avoid bursts.
-        clearTimeout(this.helloReply);
-        this.helloReply = setTimeout(() => this.announce(false), 100 + Math.random() * 600);
+        timers.clear(this.helloReply);
+        this.helloReply = timers.setTimeout(() => this.announce(false), 100 + Math.random() * 600);
       }
     }
     this.emit("change");
@@ -256,8 +309,8 @@ export class Radio extends EventTarget {
       if (!this.floor) {
         // Channel was free: open a contention window.
         this.floor = { id: msg.id, last: Date.now(), settled: false, contenders: new Set([msg.id]) };
-        clearTimeout(this.settleTimer);
-        this.settleTimer = setTimeout(() => this.settle(), CONTENTION_MS);
+        timers.clear(this.settleTimer);
+        this.settleTimer = timers.setTimeout(() => this.settle(), CONTENTION_MS);
       } else if (!this.floor.settled) {
         this.floor.contenders.add(msg.id);
         this.pickWinner();
@@ -302,7 +355,7 @@ export class Radio extends EventTarget {
     if (!floor.settled) {
       floor.contenders.delete(id);
       if (floor.contenders.size === 0) {
-        clearTimeout(this.settleTimer);
+        timers.clear(this.settleTimer);
         this.floor = null;
       } else {
         this.pickWinner();
@@ -347,13 +400,17 @@ export class Radio extends EventTarget {
 
   clearFloor() {
     const was = this.floor;
-    clearTimeout(this.settleTimer);
+    timers.clear(this.settleTimer);
     this.floor = null;
     if (was?.settled && was.id !== this.id) this.emit("rx-end");
   }
 
   tick() {
     const now = Date.now();
+    if (this.status === "online") {
+      const probeLate = this.probeAt !== 0 && now - this.probeAt > PROBE_TIMEOUT_MS;
+      if (probeLate || now - this.echoAt > ECHO_TIMEOUT_MS) return this.reconnect();
+    }
     let changed = false;
     for (const [id, peer] of this.peers) {
       if (now - peer.seen > PRESENCE_TTL_MS) {

@@ -4,6 +4,13 @@ import { CHANNEL_MAX, CHANNEL_MIN, MAX_TX_MS, RING_COOLDOWN_MS, Radio, frequency
 const DEFAULT_PREFIX = "webwalkie/v2";
 const PRE_GRANT_BUFFER = 30; // chunks (~3 s) recorded while waiting for the floor
 
+// Lock-screen artwork: the favicon on a dark tile (rendered to PNG, see makeArtwork).
+const ARTWORK_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 32 32">' +
+  '<rect width="32" height="32" fill="#131517"/><g transform="translate(4 2.5) scale(0.85)">' +
+  '<rect x="9" y="7" width="14" height="23" rx="3" fill="#ff6b1a"/><rect x="11" y="1" width="3" height="8" rx="1.5" fill="#ff6b1a"/>' +
+  '<rect x="12" y="10" width="8" height="5" rx="1" fill="#c8dc8a"/></g></svg>';
+
 const $ = (id) => document.getElementById(id);
 const ui = {
   radio: $("radio"),
@@ -49,9 +56,13 @@ let pressed = false;
 let pending = [];
 let flash = null; // {text, until}
 let wakeLock = null;
+let webLock = null; // {release?}: Web Lock held while the radio is on, see holdWebLock()
 let ringAt = Number(storage.get("wt.ringAt", "0")) || 0; // last ring we sent (survives reloads)
 let ringTimer = null; // redraws the cooldown countdown
 let ringingTimer = null; // ends the "ringing" animation
+let artwork = []; // MediaMetadata artwork, filled by makeArtwork()
+let sessionKey = ""; // media session metadata currently shown, to avoid needless updates
+let sessionState = ""; // media session playbackState currently set
 
 // ------------------------------------------------------------------ setup
 
@@ -86,6 +97,7 @@ async function powerOn() {
     config ??= await loadConfig();
   } catch (err) {
     console.error(err);
+    audio.standby();
     showFlash("AUDIO NON DISPONIBILE");
     return;
   } finally {
@@ -112,6 +124,7 @@ async function powerOn() {
   });
   radio.connect();
   requestWakeLock();
+  holdWebLock();
   render();
 }
 
@@ -120,9 +133,10 @@ function powerOff() {
   pressed = false;
   radio.disconnect();
   radio = null;
-  audio.closeMic();
+  audio.standby();
   wakeLock?.release().catch(() => {});
   wakeLock = null;
+  releaseWebLock();
   render();
 }
 
@@ -131,6 +145,93 @@ async function requestWakeLock() {
     wakeLock = await navigator.wakeLock?.request("screen");
   } catch {
     wakeLock = null;
+  }
+}
+
+/** Chrome does not freeze (or discard) a hidden page that holds a Web Lock. Shared: every open radio holds it. */
+function holdWebLock() {
+  if (webLock || !navigator.locks) return;
+  const held = {};
+  webLock = held;
+  navigator.locks
+    .request("webwalkie-radio", { mode: "shared" }, () => new Promise((resolve) => (webLock === held ? (held.release = resolve) : resolve())))
+    .catch(() => {});
+}
+
+function releaseWebLock() {
+  webLock?.release?.();
+  webLock = null;
+}
+
+/**
+ * Back in the foreground, or back online: the browser may have paused the
+ * audio and let the socket die while we were not looking.
+ */
+function wake() {
+  if (!radio) return;
+  audio.resume();
+  radio.wake();
+  requestWakeLock();
+}
+
+// ------------------------------------------------------------------ media session
+
+// The keep-alive track (audio.js) puts the radio on the lock screen and in the
+// media notification: show the channel there and map its buttons to the power switch.
+function setupMediaSession() {
+  const session = navigator.mediaSession;
+  if (!session) return;
+  const handlers = { play: () => powerOn(), pause: () => powerOff(), stop: () => powerOff() };
+  for (const [action, handler] of Object.entries(handlers)) {
+    try {
+      session.setActionHandler(action, handler);
+    } catch {
+      /* action not supported here */
+    }
+  }
+  makeArtwork();
+}
+
+function makeArtwork() {
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 256;
+      canvas.getContext("2d").drawImage(img, 0, 0, 256, 256);
+      artwork = [{ src: canvas.toDataURL("image/png"), sizes: "256x256", type: "image/png" }];
+      sessionKey = "";
+      render();
+    } catch {
+      /* no artwork, no harm */
+    }
+  };
+  img.src = `data:image/svg+xml,${encodeURIComponent(ARTWORK_SVG)}`;
+}
+
+function updateMediaSession(state) {
+  const session = navigator.mediaSession;
+  if (!session) return;
+  const playback = radio ? "playing" : "paused";
+  if (playback !== sessionState) {
+    sessionState = playback;
+    session.playbackState = playback;
+  }
+  const title = `Canale ${String(channel).padStart(2, "0")} · ${frequencyOf(channel)} MHz`;
+  const artist = {
+    off: "Spento",
+    connecting: "Connessione…",
+    pending: "In trasmissione",
+    tx: "In trasmissione",
+    rx: "In ricezione",
+  }[state] ?? "Canale libero";
+  const key = `${title}|${artist}|${artwork.length}`;
+  if (key === sessionKey) return;
+  sessionKey = key;
+  try {
+    session.metadata = new MediaMetadata({ title, artist, album: "Walkie-Talkie", artwork });
+  } catch (err) {
+    console.warn("[app] media session", err);
   }
 }
 
@@ -329,6 +430,8 @@ function render() {
     rx: "Qualcuno sta parlando",
     connecting: "Connessione al server…",
   }[state] ?? (matchMedia("(hover: hover)").matches ? "Tieni premuto per parlare (o barra spaziatrice)" : "Tieni premuto per parlare");
+
+  updateMediaSession(state);
 }
 
 // ------------------------------------------------------------------ events
@@ -423,10 +526,19 @@ document.addEventListener("keyup", (e) => {
 
 window.addEventListener("blur", () => pttUp());
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) pttUp();
-  else if (radio) requestWakeLock();
+  if (document.hidden) {
+    // Nobody can hold the button with the screen off; drop the mic too, since
+    // iOS mutes it in the background and may leave it that way.
+    pttUp();
+    audio.closeMic();
+  } else {
+    wake();
+  }
 });
+document.addEventListener("resume", wake); // Page Lifecycle: Chrome thawed a frozen page
+window.addEventListener("online", wake);
 window.addEventListener("pagehide", () => powerOff());
 
+setupMediaSession();
 startRingCountdown();
 render();
