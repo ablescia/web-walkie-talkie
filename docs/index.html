@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#131517">
+  <meta name="description" content="Walkie-talkie nel browser: scegli una frequenza e tieni premuto per parlare.">
+  <title>Walkie-Talkie</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='9' y='7' width='14' height='23' rx='3' fill='%23ff6b1a'/%3E%3Crect x='11' y='1' width='3' height='8' rx='1.5' fill='%23ff6b1a'/%3E%3Crect x='12' y='10' width='8' height='5' rx='1' fill='%23c8dc8a'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="vendor/mqtt.min.js"></script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <main class="radio" id="radio" data-state="off">
+    <header class="top">
+      <span class="led" id="led" aria-hidden="true"></span>
+      <span class="brand">WALKIE·TALKIE</span>
+      <button class="ring" id="ring" type="button" aria-label="Trillo: fai suonare tutte le radio sul canale" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a6 6 0 0 0-6 6v4.2L4.3 16.4A1 1 0 0 0 5.2 18h13.6a1 1 0 0 0 .9-1.6L18 13.2V9a6 6 0 0 0-6-6z" fill="currentColor"/><path d="M9.8 19.5a2.3 2.3 0 0 0 4.4 0z" fill="currentColor"/></svg>
+        <span id="ring-wait"></span>
+      </button>
+      <button class="power" id="power" type="button" aria-label="Accendi o spegni">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9M6.3 6.8a8 8 0 1 0 11.4 0" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+
+    <section class="lcd" id="lcd">
+      <div class="lcd-top">
+        <span id="net">SPENTO</span>
+        <span class="mode" id="mode"></span>
+      </div>
+
+      <div class="tuner">
+        <button class="step" type="button" data-step="-1" aria-label="Frequenza precedente">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="channel" id="channel" role="spinbutton" tabindex="0"
+             aria-label="Canale" aria-valuemin="1" aria-valuemax="99" aria-valuenow="1">
+          <small>CH</small><span id="chnum">01</span>
+        </div>
+        <button class="step" type="button" data-step="1" aria-label="Frequenza successiva">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+
+      <div class="freq"><span id="freq">446.00625</span> MHz</div>
+      <div class="people" id="people-row">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.4" fill="currentColor"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6z" fill="currentColor"/><circle cx="17" cy="9" r="2.6" fill="currentColor" opacity=".6"/><path d="M16 14.2c3.3 0 5.5 2.2 5.5 5.8H17c0-2.3-.4-4.2-1-5.8z" fill="currentColor" opacity=".6"/></svg>
+        <span id="people">—</span>
+      </div>
+      <div class="status" id="status" aria-live="polite">SPENTO</div>
+    </section>
+
+    <button class="ptt" id="ptt" type="button">
+      <span id="ptt-label">ACCENDI</span>
+    </button>
+    <p class="hint" id="hint">Tocca per accendere</p>
+  </main>
+</body>
+</html>

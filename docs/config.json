@@ -1,0 +1,4 @@
+{
+  "broker": "wss://broker.emqx.io:8084/mqtt",
+  "prefix": "webwalkie/v2"
+}
